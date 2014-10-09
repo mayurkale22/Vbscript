@@ -1,0 +1,221 @@
+On Error Resume Next
+
+set objshell = CreateObject("Wscript.shell")
+
+
+Const DeleteReadOnly = TRUE
+Const HKEY_LOCAL_MACHINE = &H80000002
+Const SIDExclusionList = "|S-1-5-18|S-1-5-19|S-1-5-20|"
+
+'***************************************************************************
+'*  To add your own profiles to the exclusion list simply add the
+'*  account to the end of the ProfileExclusionList.  Note: Each account
+'*  is delimited by a | (pipe) and is all lowercase
+'*
+Const ProfileExclusionList = "|administrator|all users|default user|localservice|networkservice|ctx_smauser|ctx_cpuuser|ctx_cpsvcuser|ctx_streamingsvc|ctx_configmgr|appadmin|"
+
+Dim strComputer, strLogFileName, strSystemRoot, strDocAndSettingsLocation
+Dim strKeyPath, arrValueNames, arrValueTypes, arrSubKeys
+Dim i, strHiveExclusionList, strHiveOpenSkipped, strHiveValue
+Dim strSubKey, strGuid, strUserName, strProfileImagePath
+Dim dwProfileExclusion, dwSIDExclusion, dwHiveOpenExclusion
+
+strComputer = "."
+
+Set objReg = GetObject("winmgmts:{impersonationLevel=impersonate}!\\" & strComputer & "\root\default:StdRegProv")
+Set objFSO = CreateObject("Scripting.FileSystemObject")
+Set WshShell = Wscript.CreateObject("WScript.Shell")
+Set objArgs = WScript.Arguments
+
+strSystemRoot = ""
+strSystemRoot = WshShell.ExpandEnvironmentStrings("%SYSTEMROOT%")
+If strSystemRoot = "" then
+    strSystemRoot = "C:\WINDOWS"
+End if
+
+'**********************************************************************************
+'*   Set log location to %SYSTEMROOT%\TEMP\DeleteProfiles.log if one is not
+'*   specified as an Argument
+If objArgs.Count > 0 Then
+    strLogFileName = objArgs(0)
+Else
+    strLogFileName = strSystemRoot & "\Temp\DeleteProfiles.log"
+End If
+
+Set objLogFile = objFSO.CreateTextFile(strLogFileName)
+
+WriteHeader
+
+'**********************************************************************************
+'*   Enumerate a list of loaded Registry Hives.  Delimited by the | character
+strHiveExclusionList = "|"
+strHiveOpenSkipped = "|"
+strKeyPath = "SYSTEM\CurrentControlSet\Control\hivelist"
+objReg.EnumValues HKEY_LOCAL_MACHINE, strKeyPath, arrValueNames, arrValueTypes
+For i=0 To UBound(arrValueNames)
+    strHiveValue = trim(arrValueNames(i))
+    strHiveExclusionList = strHiveExclusionList & Right(strHiveValue, len(strHiveValue) - instrrev(strHiveValue, "\")) & "|"
+Next
+
+'**********************************************************************************
+'*   Enumerate a list of known profiles from the registry
+strKeyPath = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
+objReg.EnumKey HKEY_LOCAL_MACHINE, strKeyPath, arrSubKeys
+
+'**********************************************************************************
+'*   Parse through the Profile list and Delete the Registry entries and Files associated to the Profile
+'*   Provided the profile is not listed in an Exclusion list 
+WriteLog "Checking Profile List"
+WriteLog "---------------------"
+For Each subkey In arrSubKeys
+    strSubKey = ""
+    strGuid = ""
+    strUserName = ""
+    strProfileImagePath = ""
+    strSubKey = trim(subkey)
+    if (instr(SIDExclusionList, "|" & strSubKey & "|") = 0) and (strSubKey <> "") then
+        strKeyPath = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\" & strSubKey
+        objReg.GetStringValue HKEY_LOCAL_MACHINE,strKeyPath,"Guid", strGuid
+        objReg.GetStringValue HKEY_LOCAL_MACHINE,strKeyPath,"ProfileImagePath", strProfileImagePath
+
+        strUserName = Right(strProfileImagePath, len(strProfileImagePath) - instrrev(strProfileImagePath, "\"))
+        WriteLog "Profile"
+        WriteLog "  SID         : " & strSubKey
+        WriteLog "  GUID        : " & strGuid
+        WriteLog "  Profile Path: " & strProfileImagePath
+        WriteLog "  UserName    : " & strUserName
+
+        dwProfileExclusion = instr(ProfileExclusionList, "|" & trim(lcase(strUserName)) & "|")
+        dwSIDExclusion = instr(strHiveExclusionList, "|" & strSubKey & "|")
+        If (dwProfileExclusion = 0) and (dwSIDExclusion = 0) then
+            WriteLog "  Profile OK to Delete"
+
+            strKeyPath = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\" & strSubKey
+            DeleteKey HKEY_LOCAL_MACHINE, strKeyPath
+
+            strKeyPath = "SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\" & strSubKey
+            DeleteKey HKEY_LOCAL_MACHINE, strKeyPath
+
+            strKeyPath = "SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State\" & strSubKey
+            DeleteKey HKEY_LOCAL_MACHINE, strKeyPath
+
+            strKeyPath = "SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\" & strSubKey
+            DeleteKey HKEY_LOCAL_MACHINE, strKeyPath
+
+            If strGuid <> "" then
+                strKeyPath = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\PolicyGuid\" & strGuid
+                DeleteKey HKEY_LOCAL_MACHINE, strKeyPath
+
+                strKeyPath = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileGuid\" & strGuid
+                DeleteKey HKEY_LOCAL_MACHINE, strKeyPath
+            Else
+                WriteLog "  Guid is Blank, Deleting Registry Keys based of Guid has been skipped."
+            End if
+
+            If objFSO.FolderExists(strProfileImagePath) then
+            WriteLog "  Folder Exists - Deleting"
+                'objFSO.DeleteFolder(strProfileImagePath), DeleteReadOnly
+		objshell.Run "CMD.EXE /C RD /S /Q """ & strProfileImagePath & """",0,True
+
+            Else
+                WriteLog "  Folder Does not Exist"
+            End if
+        Else
+            If dwProfileExclusion then
+                WriteLog "  Profile not Deleted --- Username in Profile Exclusion List"
+            End if
+            If dwSIDExclusion then
+                WriteLog "  Profile not Deleted --- User Hive is currently loaded"
+                strHiveOpenSkipped = strHiveOpenSkipped & trim(lcase(strUserName)) & "|"
+            End if
+        End if
+    End if
+Next
+
+'**********************************************************************************
+'*   Get Document and Settings Directory Location from the Registry
+strKeyPath = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
+objReg.GetStringValue HKEY_LOCAL_MACHINE,strKeyPath,"ProfilesDirectory", strDocAndSettingsLocation
+WriteLog ""
+WriteLog "Documents and Settings Path: " & strDocAndSettingsLocation
+WriteLog ""
+WriteLog "Checking for Orphaned Profile Directories"
+WriteLog "-----------------------------------------"
+Set objFolder = objFSO.GetFolder(strDocAndSettingsLocation)
+Set colSubfolders = objFolder.Subfolders
+
+'**********************************************************************************
+'*   Parse through the directory a check for orphaned profile folders and Delete
+For Each objSubfolder in colSubfolders
+    strUserName = lcase(Right(objSubfolder.Path, len(objSubfolder.Path) - instrrev(objSubfolder.Path, "\")))
+    dwProfileExclusion = instr(ProfileExclusionList, "|" & trim(lcase(strUserName)) & "|")
+    dwHiveOpenExclusion = instr(strHiveOpenSkipped, "|" & trim(lcase(strUserName)) & "|")
+    If (dwProfileExclusion = 0) and (dwHiveOpenExclusion = 0) then
+        WriteLog "Deleting Orphaned Profile Directory: " & objSubfolder.Path
+        'objFSO.DeleteFolder(objSubfolder.Path), DeleteReadOnly
+		objshell.Run "CMD.EXE /C RD /S /Q """ & objSubfolder.Path & """",0,True
+    Else
+        If dwHiveOpenExclusion then
+            WriteLog "Hive Loaded      -- Skippped Delete: " & objSubfolder.Path 
+        End if
+        If dwProfileExclusion then
+            WriteLog "Profile Excluded -- Skippped Delete: " & objSubfolder.Path 
+        End if
+    End if
+Next
+
+WriteFooter
+objLogFile.Close
+'objReg = Nothing
+'objFSO = Nothing
+'WshShell = Nothing
+'objArgs = Nothing
+
+'**********************************************************************************
+'*   Deletes All Subfolders and Files within a Given directory
+Sub DeleteFolderContent (strFolderName)
+    If objFSO.FolderExists(strFolderName) Then
+        Set objFolder = objFSO.GetFolder(strFolderName)
+        Set colSubfolders = objFolder.Subfolders
+        For Each objSubfolder in colSubfolders
+            objFSO.DeleteFolder(objSubfolder.Path), DeleteReadOnly
+        Next
+        objFSO.DeleteFile(strFolderName & "\*"), DeleteReadOnly
+    End If
+End Sub
+
+'**********************************************************************************
+'*   Deletes All Subkeys and Values within a Given Registry Key
+Sub DeleteKey(dwHiveType, strDeleteKeyPath)
+    Dim dwReturn, arrDeleteSubKeys, strDeleteSubKey
+    dwReturn = objReg.EnumKey(dwHiveType, strDeleteKeyPath, arrDeleteSubKeys)
+    If (dwReturn = 0) And IsArray(arrDeleteSubKeys) Then
+        For Each strDeleteSubKey In arrDeleteSubKeys
+            DeleteKey dwHiveType, strDeleteKeyPath & "\" & strDeleteSubKey
+        Next
+    End If
+    objReg.DeleteKey dwHiveType, strDeleteKeyPath
+    WriteLog "  Deleting: " & strDeleteKeyPath
+End Sub
+
+'**********************************************************************************
+'*   Log Header
+Sub WriteHeader
+    ObjLogFile.WriteLine "---"
+    ObjLogFile.WriteLine "-- Profile Deletion Script Executed: " & Now
+    ObjLogFile.WriteLine "---"
+End Sub
+
+'**********************************************************************************
+'*   Log Footer
+Sub WriteFooter
+    ObjLogFile.WriteLine "---"
+    ObjLogFile.WriteLine "-- Profile Deletion Script Completed."
+    ObjLogFile.WriteLine "---"
+End Sub
+
+'**********************************************************************************
+'*   Write String to Log File
+Sub WriteLog(strString)
+    objLogFile.Writeline strString
+End Sub
